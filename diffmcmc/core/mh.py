@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from diffmcmc.core.kernels import AbstractKernel
+from typing import Callable, Optional, Tuple, Dict, Any
 
 class DiffusionMH:
     """
@@ -11,10 +12,10 @@ class DiffusionMH:
     
     def __init__(
         self,
-        log_prob_fn: callable,
+        log_prob_fn: Callable[[torch.Tensor], torch.Tensor],
         dim: int,
         local_kernel: AbstractKernel,
-        global_proposal=None,  # Placeholder for FlowProposal
+        global_proposal: Optional[Any] = None,  # Placeholder for FlowProposal
         p_global: float = 0.2,
         device: str = "cpu"
     ):
@@ -25,7 +26,7 @@ class DiffusionMH:
         self.p_global = p_global
         self.device = device
         
-    def run(self, initial_x: torch.Tensor, num_steps: int, warmup: int = 0, seed: int = None):
+    def run(self, initial_x: torch.Tensor, num_steps: int, warmup: int = 0, seed: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, int]]:
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -58,6 +59,10 @@ class DiffusionMH:
                 # q(x') independent of x
                 try:
                     proposed_x = self.global_proposal.sample(1).squeeze(0) # (D,)
+                    # Depending on implementation, sample might return on same device or CPU. Ensure device match.
+                    if proposed_x.device != current_x.device:
+                        proposed_x = proposed_x.to(current_x.device)
+
                     proposed_lq = self.global_proposal.log_prob(proposed_x.unsqueeze(0)).squeeze(0)
                     proposed_lp = self.log_prob_fn(proposed_x)
                     
@@ -76,9 +81,14 @@ class DiffusionMH:
                         current_lp = proposed_lp
                         current_lq = proposed_lq
                         accepted = True
+                except RuntimeError as e:
+                     # Catch specific runtime errors (e.g. numerical stability in flow)
+                    print(f"Global move warning: {e}")
+                    accepted = False
                 except Exception as e:
-                    # Fallback or error logging? For now print to catch bugs
-                    print(f"Global move error: {e}")
+                    # For other unexpected errors, we should likely raise or log seriously.
+                    # Retaining print for now but making it clearer it's a critical failure in proposal.
+                    print(f"Global move failed unexpectedly: {e}")
                     accepted = False
 
                 if accepted: stats["accept_global"] += 1
@@ -106,6 +116,6 @@ class DiffusionMH:
                 if accepted: stats["accept_local"] += 1
             
             if step >= warmup:
-                chain.append(current_x.cpu().numpy())
+                chain.append(current_x.detach().cpu().numpy())
                 
         return np.array(chain), stats

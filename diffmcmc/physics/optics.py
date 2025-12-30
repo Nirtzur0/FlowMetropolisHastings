@@ -45,144 +45,87 @@ class TransferMatrixMethod(nn.Module):
         lam = wavelengths.view(1, 1, -1) # (1, 1, W)
         
         batch_size = n.shape[0]
-        num_layers = n.shape[1]
+        # num_layers = n.shape[1] # Unused if we vectorize
         num_waves = lam.shape[2]
         
-        # Characteristic Admittance (Normal incidence: Y = n)
-        # In general Y_s = n * cos(theta), Y_p = n / cos(theta)
-        # For normal, theta=0 => Y = n.
+        # 1. Compute Layer Matrices for ALL layers at once (Vectorized)
+        # Layers 1 to N-2 (Internal Layers)
+        # We slice indices [1:-1]
         
-        # System Matrix M (Start as Identity)
-        # M is (B, 2, 2, W)
-        M = torch.eye(2, dtype=torch.complex64, device=n.device)
-        M = M.view(1, 2, 2, 1).expand(batch_size, -1, -1, num_waves).clone()
+        n_i = n[:, 1:-1, :] # (B, N_internal, 1)
+        d_i = d[:, 1:-1, :] # (B, N_internal, 1)
         
-        # Iterate through layers (excluding first and last which are infinite media)
-        # The structure is: Substrate (0) | Layer 1 | ... | Layer N | Ambient (-1)
-        # Or: Ambient (0) | Layer 1 ... | Substrate
-        # Convention: Light comes from Ambient (Layer 0) -> Stack -> Substrate (Layer -1).
-        # But standard formulation typically propagates from first interface to last.
+        k0 = 2 * torch.pi / lam # (1, 1, W)
+        phi = n_i * d_i * k0 # (B, N_int, W)
         
-        # Let's define n_layers as [n_incident, n_1, ..., n_substrate]
-        # Iterate interfaces. Interface k is between layer k-1 and k.
+        cos_phi = torch.cos(phi)
+        sin_phi = torch.sin(phi)
         
-        # Standard Transfer Matrix recursive formulation:
-        # M_total = M_1 * M_2 * ... * M_N
-        # where M_layer is phase propagation.
-        # Wait, usually M relates fields.
-        # M_layer = [[cos phi, -i/n sin phi], [-i n sin phi, cos phi]]
+        # Construct M_layer tensor: (B, N_int, W, 2, 2)
+        # M = [[cos, -i/n sin], [-in sin, cos]]
         
-        # Loop over inner layers (1 to N-2) if N is total count including semi-infinite ends
-        # Indices: 0=Input Medium, 1..N-2=Thin Films, N-1=Exit Medium
+        zeros = torch.zeros_like(phi)
         
-        for i in range(1, num_layers - 1):
-            n_i = n[:, i, :]
-            d_i = d[:, i, :]
-            
-            # Phase thickness phi = 2 pi n d / lambda
-            k0 = 2 * torch.pi / lam # (1, 1, W)
-            phi = n_i * d_i * k0 # (B, 1, W)
-            
-            cos_phi = torch.cos(phi)
-            sin_phi = torch.sin(phi)
-            
-            # Construct Layer Matrix M_i
-            # Shape (B, 2, 2, W)
-            # m00 = cos_phi
-            # m01 = -1j * sin_phi / n_i
-            # m10 = -1j * n_i * sin_phi
-            # m11 = cos_phi
-            
-            # Stack manually to form matrix
-            # Be careful with dimensions
-            # We want (B, 2, 2, W)
-            
-            zeros = torch.zeros_like(phi)
-            ones = torch.ones_like(phi)
-            
-            # Re-assemble
-            # This is slightly slow in loop, specialized kernels better, but ok for demo.
-            
-            # Optimized matrix multiplication: M_new = M_old @ M_layer
-            # M_layer elements:
-            m11 = cos_phi
-            m12 = -1j * sin_phi / (n_i + 1e-8) # Avoid div zero
-            m21 = -1j * n_i * sin_phi
-            m22 = cos_phi
-            
-            # M_curr (B, 2, 2, W)
-            # Perform batch matmul (B, ..., 2, 2)
-            # permute W to batch dim or keep as is?
-            # torch.matmul broadcasts over Batch, but W is at end?
-            # let's permute to (B, W, 2, 2) for matmul
-            
-            M = M.permute(0, 3, 1, 2) # (B, W, 2, 2)
-            
-            M_layer = torch.zeros_like(M)
-            M_layer[:, :, 0, 0] = m11.squeeze(1)
-            M_layer[:, :, 0, 1] = m12.squeeze(1)
-            M_layer[:, :, 1, 0] = m21.squeeze(1)
-            M_layer[:, :, 1, 1] = m22.squeeze(1)
-            
-            M = torch.matmul(M, M_layer)
-            M = M.permute(0, 2, 3, 1) # Back to (B, 2, 2, W)
-            
-        # Apply Boundary Conditions to get R
-        # Fields: [E0, H0] = M [E_sub, H_sub]
-        # At substrate (infinite), only forward wave: E_sub = 1, H_sub = n_sub * E_sub = n_sub
-        # No, that's not quite right.
-        # Ref: Orfanidis "Electromagnetic Waves", Ch 4.
-        # B = (M00 + M01 n_sub) + (M10 + M11 n_sub) / n_0  <-- if using transmission coeff formulation
+        m11 = cos_phi
+        m12 = -1j * sin_phi / (n_i + 1e-8)
+        m21 = -1j * n_i * sin_phi
+        m22 = cos_phi
         
-        # Let's use Characteristic Matrix approach:
-        # [B, C] = M * [1, n_sub] (Assuming normalized E_sub=1)
-        # Admittance Y = C / B
-        # Reflection coefficient r = (Y_0 - Y) / (Y_0 + Y)
-        # where Y_0 = n_incident
+        # We need these stacked into (..., 2, 2) matrices.
+        # Current shape of m elements: (B, N_int, W)
         
-        n_in = n[:, 0, :]   # Incident medium
-        n_sub = n[:, -1, :] # Substrate
+        # Stack to (B, N_int, W, 2, 2)
+        # Rows:
+        row1 = torch.stack([m11, m12], dim=-1) # (..., 2)
+        row2 = torch.stack([m21, m22], dim=-1) # (..., 2)
+        M_all = torch.stack([row1, row2], dim=-2) # (B, N_int, W, 2, 2)
         
-        # M is total transfer matrix of the STACK (excluding interfaces with ambient/sub)
-        # Wait, classical TMM includes the interfaces?
-        # The formulation above (M_layer) propagates fields across the layer.
-        # The BCs at the ends incorporate the refractive indices of semi-infinite media.
+        # 2. Multiply Matrices
+        # We need M_total = M_1 @ M_2 @ ... @ M_N
+        # PyTorch doesn't have a built-in "matmul along dim" (reduce matmul).
+        # But since N_layers is small (~10-50), a simple loop over the reduced dimension is cleaner than generic reduce.
+        # Alternatively, assume we can reshape? No, order matters.
         
-        # Matvec: [E_in, H_in] = M @ [E_out, H_out]
-        # Boundary condition at output (substrate): No backward wave.
-        # E_out = 1, H_out = n_sub * E_out = n_sub
+        # However, we can use the loop here but keeping (W) vectorized.
+        # Previous code had W inside the matrix or permuted.
         
-        # Vector (B, 2, 1, W)
-        BC_sub = torch.zeros(batch_size, 2, 1, num_waves, dtype=torch.complex64, device=n.device)
-        BC_sub[:, 0, 0, :] = 1.0
-        # n_sub is (B, 1). Expand to (B, W).
-        BC_sub[:, 1, 0, :] = n_sub.squeeze(1).unsqueeze(-1).expand(-1, num_waves)
+        # Let's define Accumulated M: (B, W, 2, 2)
+        # Start as Identity
+        M_total = torch.eye(2, dtype=torch.complex64, device=n.device)
+        M_total = M_total.view(1, 1, 2, 2).expand(batch_size, num_waves, -1, -1).clone()
+        
+        # Rearrange M_all to (N_int, B, W, 2, 2) to iterate over layers easily
+        M_all = M_all.permute(1, 0, 2, 3, 4)
+        
+        # Loop over layers (Vectorized over Batch and Wavelength now!)
+        for i in range(M_all.shape[0]):
+             M_layer = M_all[i] # (B, W, 2, 2)
+             M_total = torch.matmul(M_total, M_layer)
+             
+        # 3. Apply Boundary Conditions
+        # n_in (Ambient, index 0), n_sub (Substrate, index -1)
+        n_in = n[:, 0, :]   # (B, 1)
+        n_sub = n[:, -1, :] # (B, 1)
+        
+        # BC_sub: [1, n_sub]
+        # (B, W, 2, 1)
+        BC_sub = torch.zeros(batch_size, num_waves, 2, 1, dtype=torch.complex64, device=n.device)
+        BC_sub[:, :, 0, 0] = 1.0
+        BC_sub[:, :, 1, 0] = n_sub.expand(-1, num_waves)
         
         # Propagate to input
-        # M: (B, 2, 2, W)
-        # (B, 2, 2, W) @ (B, 2, 1, W) -> (B, 2, 1, W)
-        # matmul auto-broadcasts? Dimensions must align.
-        # M is (B, 2, 2, W), BC is (B, 2, 1, W). Matmul operates on last 2 dims.
-        # So we need to permute W out of the way or handle it.
+        # EH_in = M_total @ BC_sub
+        EH_in = torch.matmul(M_total, BC_sub) # (B, W, 2, 1)
         
-        M_run = M.permute(0, 3, 1, 2) # (B, W, 2, 2)
-        BC_run = BC_sub.permute(0, 3, 1, 2) # (B, W, 2, 1)
+        E_in = EH_in[:, :, 0, 0] 
+        H_in = EH_in[:, :, 1, 0]
         
-        EH_in = torch.matmul(M_run, BC_run) # (B, W, 2, 1)
-        
-        E_in = EH_in[:, :, 0, 0] # (B, W)
-        H_in = EH_in[:, :, 1, 0] # (B, W)
-        
-        # Input Admittance Y_in = H_in / E_in
+        # Input Admittance
         Y_in = H_in / (E_in + 1e-9)
         
-        # Reflection Coefficient r = (n_in - Y_in) / (n_in + Y_in)
-        # careful with sign convention. traditionally (Y0 - Y)/(Y0 + Y)
-        n_in_sq = n_in.expand(-1, num_waves) # n_in is (B, 1). Expand to (B, W).
-        
+        # Reflectance
+        n_in_sq = n_in.expand(-1, num_waves)
         r = (n_in_sq - Y_in) / (n_in_sq + Y_in)
-        
-        # Reflectance R = |r|^2
         R = torch.abs(r)**2
         
         return R

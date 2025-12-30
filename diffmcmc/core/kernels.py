@@ -1,12 +1,13 @@
 import abc
 import torch
 import numpy as np
+from typing import Tuple, Callable
 
 class AbstractKernel(abc.ABC):
     """Abstract base class for local MCMC kernels."""
     
     @abc.abstractmethod
-    def propose(self, current_x: torch.Tensor, log_prob_fn: callable) -> tuple[torch.Tensor, torch.Tensor]:
+    def propose(self, current_x: torch.Tensor, log_prob_fn: Callable[[torch.Tensor], torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Propose a new state given the current state.
         
@@ -27,7 +28,7 @@ class RWMKernel(AbstractKernel):
     def __init__(self, scale: float = 1.0):
         self.scale = scale
         
-    def propose(self, current_x: torch.Tensor, log_prob_fn: callable) -> tuple[torch.Tensor, torch.Tensor]:
+    def propose(self, current_x: torch.Tensor, log_prob_fn: Callable[[torch.Tensor], torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         # x' = x + N(0, scale^2 I)
         noise = torch.randn_like(current_x) * self.scale
         proposed_x = current_x + noise
@@ -42,12 +43,9 @@ class MALAKernel(AbstractKernel):
     def __init__(self, step_size: float):
         self.step_size = step_size
         
-    def propose(self, current_x: torch.Tensor, log_prob_fn: callable) -> tuple[torch.Tensor, torch.Tensor]:
+    def propose(self, current_x: torch.Tensor, log_prob_fn: Callable[[torch.Tensor], torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         # Gradient computation required. 
         # We need the gradient of log_prob at current_x.
-        # Note: In a real efficient loop, we might want to cache this gradient.
-        # For MVP, we recompute or expect it to be passed? 
-        # Let's recompute for safety unless we change the API to pass state objects.
         
         x = current_x.detach().clone().requires_grad_(True)
         lp = log_prob_fn(x)
@@ -56,6 +54,10 @@ class MALAKernel(AbstractKernel):
         dt = self.step_size ** 2
         # x' = x + (dt/2) * grad + sqrt(dt) * z
         noise = torch.randn_like(current_x)
+        if torch.isnan(grad).any():
+             # Fallback if gradient explodes?
+             grad = torch.zeros_like(grad)
+             
         mean_forward = x + (dt / 2) * grad
         proposed_x = mean_forward + self.step_size * noise
         
@@ -65,6 +67,10 @@ class MALAKernel(AbstractKernel):
         lp_p = log_prob_fn(xp)
         grad_p = torch.autograd.grad(lp_p, xp)[0]
         
+        if torch.isnan(grad_p).any():
+             # Fallback
+             grad_p = torch.zeros_like(grad_p)
+
         mean_backward = xp + (dt / 2) * grad_p
         
         # q(x'|x) proportional to exp(-||x' - mean_fwd||^2 / (2 dt))

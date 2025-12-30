@@ -17,8 +17,11 @@ def test_flow_reversibility():
     dt = 0.1
     steps = int(1.0/dt)
     
+    def dynamics(x_curr, t_curr):
+        return flow.net(x_curr, t_curr)
+
     for _ in range(steps):
-        x = flow._ode_step(x, t, dt)
+        x = flow._rk4_step_func(dynamics, x, t, dt)
         t += dt
         
     # Backward: 1 -> 0
@@ -27,7 +30,7 @@ def test_flow_reversibility():
     dt = -0.1
     
     for _ in range(steps):
-        z_rec = flow._ode_step(z_rec, t, dt)
+        z_rec = flow._rk4_step_func(dynamics, z_rec, t, dt)
         t += dt
         
     # Check error
