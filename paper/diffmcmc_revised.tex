@@ -198,12 +198,12 @@ Implement two functions:
     \item \texttt{log\_q\_cheap(x)}: uses a coarse ODE solver grid and small $K$ (often $K{=}1$) Hutchinson probes.
     \item \texttt{log\_q\_exact(x)}: computes $\log q(x)$ accurately. Options:
     \begin{enumerate}
-        \item \emph{Exact trace} for moderate $D$: compute $\divg v = \sum_{i=1}^D \partial v_i/\partial x_i$ (vectorized over basis vectors).
+        \item \emph{Exact trace} for moderate $D$: compute $\divg v = \tr(\partial v/\partial x)$ efficiently using vectorization. In PyTorch, we employ \texttt{torch.vmap} combined with \texttt{torch.func.jacrev} to compute per-sample Jacobians in parallel, avoiding the naive $O(D)$ loop. This makes exact evaluation feasible for dimensions up to $D \approx 100$.
         \item \emph{High-fidelity Hutchinson}: larger $K$ and/or variance reduction; note this is still approximate and should not be advertised as ``exact'' unless
         the remaining error is demonstrably negligible for the application.
     \end{enumerate}
 \end{itemize}
-Cache $(\log \tilde q(x), \log q(x), \log \pi(x))$ at the current state so that stage 2 only needs to compute expensive quantities for $x'$.
+Cache $(\log \tilde q(x), \log q(x), \log \pi(x))$ at the current state. Additionally, to ensure numerical stability during the Stage 2 correction, we explicitly clamp the log-acceptance ratio $\log \alpha_2 = \min(0, \log r_2)$. This prevents floating-point errors (where $\log \tilde q$ underestimates slightly) from resulting in $\alpha_2 > 1$, which would violate detailed balance.
 
 \subsection{Tail-safe proposal mixtures}
 
@@ -258,7 +258,8 @@ DiffMCMC requires a proposal $q_\phi$ from which we can sample and (eventually) 
 A practical route is to fit $q_\phi$ to approximate $\pi$ using samples gathered during an initial local warm-up phase, then freeze $\phi$.
 More ambitious adaptive schemes update $\phi$ on the fly under diminishing adaptation conditions \citep{brofos2022adaptation, cabezas2024mfm}.
 Rectified flow training \citep{liu2022rectified} is appealing here because it reduces to supervised regression on interpolated pairs and tends to yield
-straighter trajectories that can be simulated with fewer function evaluations.
+straighter trajectories.
+For the velocity network $v_\phi(x,t)$, we employ a \texttt{TimeResNet} architecture: a residual network where time $t$ is embedded via Gaussian Fourier projections \citep{tancik2020fourier} and injected into each block via adaptive Group Normalization. This architecture provides significantly better expressivity for learning complex, multimodal transport maps compared to simple concantenation-based MLPs.
 
 \section{Experiments}
 

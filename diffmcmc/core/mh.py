@@ -125,19 +125,13 @@ class DiffusionMH:
                         # Probability of acceptance at stage 2
                         # alpha_2 = alpha_true / alpha_1
                         # log_alpha_2 = log_alpha_true - log_alpha_1
-                        log_alpha_2 = log_alpha_true - log_alpha_1
                         
-                        # Numerical safety check (should be <= 0)
-                        if log_alpha_2 > 1e-6:
-                             # This can happen due to float errors or if alpha_1 was very small but alpha_true is large?
-                             # Theoretically alpha_2 <= 1 -> log <= 0.
-                             # But if cheap rejected it should have rejected.
-                             # If cheap accepted (alpha_1 < 1), and true accepts (alpha_true=1), then alpha_2 > 1?
-                             # Wait. alpha_true <= 1. alpha_1 <= 1.
-                             # If alpha_1 = 0.5, alpha_true = 0.8. alpha_2 = 1.6 > 1?
-                             # In that case, we accept with probability 1 (min(1, 1.6)).
-                             # So log_alpha_2 should be capped at 0.
-                             pass
+                        raw_log_alpha_2 = log_alpha_true - log_alpha_1
+                        
+                        # Numerical stability: enforce alpha_2 <= 1.
+                        # Floating point errors can cause log_alpha_true to be slightly larger than log_alpha_1
+                        # if the cheap approximation was very close but underestimated slightly.
+                        log_alpha_2 = min(0.0, raw_log_alpha_2)
                              
                         if torch.log(torch.rand(1).to(self.device)) < log_alpha_2:
                             current_x = proposed_x

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from diffmcmc.proposal.nets import VelocityMLP
+from diffmcmc.proposal.nets import VelocityMLP, TimeResNet
 from typing import Optional, Any
 
 class FlowProposal(nn.Module):
@@ -21,7 +21,7 @@ class FlowProposal(nn.Module):
        We achieve this by hashing x to seed the Hutchinson noise \epsilon.
     """
     def __init__(self, dim: int, model: Optional[nn.Module] = None, step_size: float = 0.1, deterministic_trace: bool = True,
-                 mixture_prob: float = 0.0, broad_scale: float = 2.0):
+                 mixture_prob: float = 0.0, broad_scale: float = 2.0, use_resnet: bool = True):
         """
         Args:
             dim: Dimension of data.
@@ -30,6 +30,7 @@ class FlowProposal(nn.Module):
             deterministic_trace: If True, uses hashed noise for density estimation.
             mixture_prob: Probability 'eta' of sampling from broad background distribution.
             broad_scale: Scale (std) of the broad background Gaussian.
+            use_resnet: If True and model is None, uses TimeResNet. Otherwise VelocityMLP.
         """
         super().__init__()
         self.dim = dim
@@ -39,7 +40,11 @@ class FlowProposal(nn.Module):
         self.broad_scale = broad_scale
         
         if model is None:
-            self.net = VelocityMLP(dim)
+            if use_resnet:
+                # Default configuration for TimeResNet
+                self.net = TimeResNet(dim)
+            else:
+                self.net = VelocityMLP(dim)
         else:
             self.net = model
             
@@ -230,37 +235,25 @@ class FlowProposal(nn.Module):
                 x_in = x_c.detach().requires_grad_(True)
                 v = self.net(x_in, t_curr)
                 
-                # 2. dtrace/dt = div(v)
+            # 2. dtrace/dt = div(v)
                 if exact_trace:
-                    # Exact Divergence: Trace(J)
-                    # We can use jvp with one-hot vectors or full jacobian.
-                    # For moderate D, full jacobian via vmap?
-                    # x_in: (B, D) -> v: (B, D)
-                    # We need sum_i d(v_i)/d(x_i) for each batch element.
+                    # Efficient Exact Trace using vmap + jacrev
+                    # We compute the Jacobian for each batch element: (D, D)
+                    # Then take the trace.
                     
-                    # Efficient exact trace in PyTorch is hard without vmap/jacrev.
-                    # Use a loop over dimensions?
-                    div_est = torch.zeros(batch_size, 1, device=device)
-                    # This is very slow for large D. Hence why we only use it for D<=64.
+                    def dynamics_func(x_in_inner):
+                        # Wrapper to handle (D,) input -> (D,) output for jacrev
+                        # We need to unsqueeze to pass to net (expecting B, D)
+                        # but vmap handles the batch dimension.
+                        return self.net(x_in_inner.unsqueeze(0), t_curr).squeeze(0)
+
+                    # Compute Jacobian per sample: (B, D, D)
+                    # use jacrev (reverse mode AD) which is usually better for D_out ~ D_in
+                    jac = torch.vmap(torch.func.jacrev(dynamics_func))(x_in)
                     
-                    # Optimized way:
-                    # grad_outputs = v
-                    # but that's not divegence.
-                    
-                    # We compute gradients of v[:, i] w.r.t x[:, i]
-                    for i in range(self.dim):
-                         # grad of v_i w.r.t x
-                         # v is (B, D). v[:, i] is (B,)
-                         # create_graph=True needed? No, we are inside no_grad (RK4), but we enabled grad here.
-                         # We need 2nd derivatives? No, just 1st.
-                         
-                         # autograd.grad(outputs, inputs)
-                         # We want d(v_i)/d(x_i).
-                         # We can compute grad(sum(v[:, i]), x) -> (B, D). Then take i-th component.
-                         g = torch.autograd.grad(v[:, i].sum(), x_in, create_graph=False, retain_graph=True)[0]
-                         div_est[:, 0] += g[:, i]
-                         
-                    trace_est = div_est
+                    # Trace: sum of diagonal elements (B,)
+                    # jac: (B, D, D) -> diagonal: (B, D) -> sum: (B,)
+                    trace_est = torch.vmap(torch.trace)(jac).unsqueeze(1)
                     
                 else:
                     # Hutchinson Trace
