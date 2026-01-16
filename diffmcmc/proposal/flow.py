@@ -51,6 +51,7 @@ class FlowProposal(nn.Module):
         # Fixed random vector for pseudo-hashing
         # This acts as a "salt" for the hash function
         self.register_buffer("hash_salt", torch.randn(dim))
+        self.register_buffer("log_2pi", torch.tensor(np.log(2 * np.pi)))
 
     def _rk4_step_func(self, f: Any, x: torch.Tensor, t: float, dt: float) -> torch.Tensor:
         """Standard RK4 stepper for arbitrary function f(x, t)."""
@@ -186,7 +187,7 @@ class FlowProposal(nn.Module):
         
         log_r_broad = -0.5 * torch.sum((x / scale)**2, dim=1) \
                       - D * np.log(scale) \
-                      - 0.5 * D * np.log(2 * np.pi)
+                      - 0.5 * D * self.log_2pi
                       
         # logsumexp
         # log_p = log( (1-eta) exp(lqf) + eta exp(lrb) )
@@ -289,6 +290,6 @@ class FlowProposal(nn.Module):
              t += dt
             
         # Final z is xt (at t=0)
-        log_prob_z = -0.5 * torch.sum(xt**2, dim=1) - 0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi, device=device))
+        log_prob_z = -0.5 * torch.sum(xt**2, dim=1) - 0.5 * self.dim * self.log_2pi
         
         return log_prob_z - log_jac_trace.squeeze(1)
