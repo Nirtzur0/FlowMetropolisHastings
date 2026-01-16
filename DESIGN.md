@@ -36,6 +36,12 @@ We model $q_\phi$ using a Vector Field $v_\phi(x, t)$.
   1. Use exact divergence (expensive for high dim).
   2. Use the same "randomness" for evaluating $q(x)$ every time $x$ is visited. This implies hashing $x$ to seed $\epsilon$ or storing the computed $\log q(x)$ with the chain state. We will store $\log q(x)$ in the chain state so re-evaluation isn't needed for the *current* point, only the *proposed* point.
 
+### 2.4 Inference Modes
+DiffMCMC exposes explicit inference modes with contracts:
+- **exact**: delayed-acceptance with an exact proposal density; requires deterministic log-density evaluation and a consistent integration grid. Warnings are emitted when conditions are not met.
+- **pseudo_marginal**: requires an unbiased estimator of $q(x)$ in an extended state space.
+- **approx**: uses approximate $q(x)$ for speed; may introduce bias.
+
 ## 3. Architecture
 
 ### 3.1 Project Structure
@@ -75,6 +81,8 @@ diffmcmc/
   - *Decision*: "Safe Mode" MVP. Train once after warmup, then freeze. Adaptive retraining is a stretch.
 - **Density Estimation**:
   - *Decision*: Store `log_q` of the current state to avoid re-computation. When proposing $x'$, compute $\log q(x')$. If accepted, cache it.
+- **Integrator Contract**:
+  - *Decision*: Enforce step-size divisibility for stable grids; optionally compute discrete-step logdet for exactness on small dimensions.
 
 ## 5. Technology Stack
 - **Python 3.11+**

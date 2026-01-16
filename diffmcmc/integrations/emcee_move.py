@@ -1,15 +1,22 @@
 import numpy as np
 import torch
 from emcee.moves import Move
+from diffmcmc.core.inference import InferenceMode, validate_inference_mode
 
 class DiffusionMove(Move):
     """
     An emcee Move that uses a trained Global Proposal (Flow).
     """
-    def __init__(self, flow_proposal, p_global=0.2, local_move=None):
+    def __init__(self, flow_proposal, p_global=0.2, local_move=None, inference_mode: str = "approx"):
         self.flow = flow_proposal
         self.p_global = p_global
         self.local_move = local_move # Fallback local move
+        report = validate_inference_mode(inference_mode, self.flow, strict=False)
+        self.inference_mode = report.effective_mode
+        if self.inference_mode == InferenceMode.EXACT:
+            self._log_prob = getattr(self.flow, "log_prob_exact", self.flow.log_prob)
+        else:
+            self._log_prob = self.flow.log_prob
         
     def propose(self, model, state):
         """
@@ -43,10 +50,10 @@ class DiffusionMove(Move):
             
             # Compute q(x) and q(x')
             # q(x) - density of CURRENT states
-            log_q_curr = self.flow.log_prob(x_curr).cpu().numpy()
+            log_q_curr = self._log_prob(x_curr).cpu().numpy()
             
             # q(x') - density of PROPOSED states
-            log_q_prop = self.flow.log_prob(x_prop_t).cpu().numpy()
+            log_q_prop = self._log_prob(x_prop_t).cpu().numpy()
             
             # MH factor = q(x)/q(x')
             # log_factor = log_q_curr - log_q_prop

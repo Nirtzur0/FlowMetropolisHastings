@@ -1,0 +1,39 @@
+[experiment]
+name = "mog_demo"
+output_dir = "runs"
+seed = 123
+
+[target]
+type = "mog"
+dim = 2
+centers = [[-3.0, -3.0], [3.0, 3.0]]
+scale = 1.0
+
+[local_kernel]
+type = "rwm"
+scale = 1.0
+
+[global_proposal]
+type = "flow"
+step_size = 0.1
+deterministic_trace = true
+mixture_prob = 0.1
+broad_scale = 2.0
+
+[sampler]
+num_steps = 1000
+warmup = 200
+p_global = 0.2
+inference_mode = "approx"
+
+[orchestrator]
+num_chains = 4
+
+[adapt]
+enabled = true
+interval = 50
+target_accept_local = 0.234
+target_accept_global = 0.3
+
+[training]
+enabled = false

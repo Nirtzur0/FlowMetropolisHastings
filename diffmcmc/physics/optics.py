@@ -11,6 +11,7 @@ class TransferMatrixMethod(nn.Module):
     - Normal incidence (can be extended to angles).
     - Non-magnetic materials (mu=1).
     - Polarization generic (normal incidence s=p).
+    - Layer ordering: index 0 is the incident medium (ambient), light propagates toward index -1 (substrate).
     """
     def __init__(self):
         super().__init__()
@@ -22,17 +23,22 @@ class TransferMatrixMethod(nn.Module):
         """
         Args:
             n_layers: (Batch, N_layers) Refractive indices (complex or real).
-                      Typically: [n_substrate, n_1, n_2, ..., n_ambient]
+                      Ordering is from incident side to exit side: [n_ambient, n_1, n_2, ..., n_substrate].
             d_layers: (Batch, N_layers) Physical thicknesses in nanometers.
-                      Note: Substrate and Ambient thicknesses are ignored (treated as semi-infinite).
+                      Thicknesses follow the same ordering; ambient/substrate entries are ignored.
             wavelengths: (W,) Wavelengths in nanometers.
             
         Returns:
             R: (Batch, W) Reflectance spectrum.
         """
-        # Ensure complex for Fresnel calc
+        # Normalize dtypes for mixed precision: compute in float32 / complex64.
         if not n_layers.is_complex():
+            n_layers = n_layers.to(dtype=torch.float32)
             n_layers = n_layers.to(torch.complex64)
+        else:
+            n_layers = n_layers.to(dtype=torch.complex64)
+        d_layers = d_layers.to(dtype=torch.float32)
+        wavelengths = wavelengths.to(dtype=torch.float32)
             
         # Add singleton dims for broadcasting:
         # Batch (B), Layers (L), Wavelengths (W)
@@ -91,7 +97,7 @@ class TransferMatrixMethod(nn.Module):
         
         # Let's define Accumulated M: (B, W, 2, 2)
         # Start as Identity
-        M_total = torch.eye(2, dtype=torch.complex64, device=n.device)
+        M_total = torch.eye(2, dtype=n.dtype, device=n.device)
         M_total = M_total.view(1, 1, 2, 2).expand(batch_size, num_waves, -1, -1).clone()
         
         # Rearrange M_all to (N_int, B, W, 2, 2) to iterate over layers easily
@@ -109,7 +115,7 @@ class TransferMatrixMethod(nn.Module):
         
         # BC_sub: [1, n_sub]
         # (B, W, 2, 1)
-        BC_sub = torch.zeros(batch_size, num_waves, 2, 1, dtype=torch.complex64, device=n.device)
+        BC_sub = torch.zeros(batch_size, num_waves, 2, 1, dtype=n.dtype, device=n.device)
         BC_sub[:, :, 0, 0] = 1.0
         BC_sub[:, :, 1, 0] = n_sub.expand(-1, num_waves)
         

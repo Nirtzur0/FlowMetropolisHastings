@@ -34,9 +34,19 @@ graph LR
 
 -   **Local Kernel**: Keeps exploring the details of the current mode (RWM, MALA).
 -   **Global Kernel**: Occasionally activates the flow model to propose a jump to a completely different mode.
--   **Training**: The flow model trains *online* (or offline) on the samples collected so far, constantly improving its map of the territory.
+-   **Training**: The flow model can be trained offline or during warmup; it should be frozen before sampling for valid diagnostics.
 
 ---
+
+## ✅ Guarantees & Inference Modes
+
+DiffMCMC exposes explicit inference modes with contracts and warnings:
+
+- **exact**: Delayed-acceptance with an exact proposal density. Requires a deterministic log density, a valid integration grid, and an exact evaluation of `log q(x)` (e.g. exact trace + optional discrete logdet). If conditions are not met, the sampler warns and falls back to **approx** unless `strict_exactness=True`.
+- **pseudo_marginal**: Requires an *unbiased* estimator of `q(x)` with auxiliary randomness. This is not yet provided by `FlowProposal` and will warn/fall back.
+- **approx**: Uses approximate `log q` (cheap solvers / trace estimators). Fast, but biased.
+
+For multi-chain runs, adaptation and flow training are restricted to warmup to preserve stationarity in the sampling phase.
 
 ## ⚡ Quickstart
 
@@ -63,7 +73,7 @@ def log_prob_fn(x):
     ]), dim=0).sum()
 
 # 2. Initialize the Global Teleporter (Flow)
-# deterministic_trace=True guarantees exactness!
+# deterministic_trace=True makes log_q deterministic; exactness also depends on solver fidelity.
 flow = FlowProposal(dim=2, deterministic_trace=True)
 
 # 3. Initialize the Sampler
@@ -108,7 +118,20 @@ We don't just solve toy problems. `DiffMCMC` is used to invert physical simulati
 
 -   **Rectified Flow Matching**: State-of-the-art straight-path transport.
 -   **Hutchinson Trace Estimator**: Linear scaling with dimension ($O(D)$).
--   **Exactness Theorems**: Verified via Kolmogorov-Smirnov tests.
+-   **Diagnostics**: Geyer ESS, rank-normalized R-hat, and regression tests for delayed-acceptance balance.
+
+---
+
+## 🧰 Config-Driven Runs
+
+Run experiments from a config and store standardized logs:
+
+```bash
+diffmcmc-run --config configs/mog.toml
+```
+
+The runner saves `config.json`, `stats.json`, and chain arrays under `runs/`.
+For multi-chain runs it also writes `diagnostics.json` with R-hat summaries.
 -   **PyTorch Native**: Fully differentiable, GPU accelerated.
 
 ---

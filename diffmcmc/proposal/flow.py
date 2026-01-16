@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import warnings
 from diffmcmc.proposal.nets import VelocityMLP, TimeResNet
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 class FlowProposal(nn.Module):
     r"""
@@ -20,8 +21,22 @@ class FlowProposal(nn.Module):
        To ensure detailed balance in MH, the density estimate q(x) must be a deterministic function of x.
        We achieve this by hashing x to seed the Hutchinson noise \epsilon.
     """
-    def __init__(self, dim: int, model: Optional[nn.Module] = None, step_size: float = 0.1, deterministic_trace: bool = True,
-                 mixture_prob: float = 0.0, broad_scale: float = 2.0, use_resnet: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        model: Optional[nn.Module] = None,
+        step_size: float = 0.1,
+        deterministic_trace: bool = True,
+        mixture_prob: float = 0.0,
+        broad_scale: float = 2.0,
+        use_resnet: bool = True,
+        integrator: str = "rk4",
+        enforce_divisible: bool = True,
+        auto_adjust_step_size: bool = True,
+        exact_discrete_logdet: bool = False,
+        max_exact_trace_dim: int = 64,
+        max_exact_logdet_dim: int = 32
+    ):
         """
         Args:
             dim: Dimension of data.
@@ -31,10 +46,24 @@ class FlowProposal(nn.Module):
             mixture_prob: Probability 'eta' of sampling from broad background distribution.
             broad_scale: Scale (std) of the broad background Gaussian.
             use_resnet: If True and model is None, uses TimeResNet. Otherwise VelocityMLP.
+            integrator: Numerical integrator ("rk4" or "euler").
+            enforce_divisible: Enforce step_size dividing 1.0 for consistent integration grids.
+            auto_adjust_step_size: If True, adjust step_size to the nearest divisor of 1.0.
+            exact_discrete_logdet: If True, compute discrete-step logdet via Jacobians (exact but expensive).
+            max_exact_trace_dim: Max dimension for exact trace in log_prob_exact.
+            max_exact_logdet_dim: Max dimension for exact discrete logdet computation.
         """
         super().__init__()
         self.dim = dim
-        self.step_size = step_size
+        self.integrator = integrator
+        self.exact_discrete_logdet = exact_discrete_logdet
+        self.max_exact_trace_dim = max_exact_trace_dim
+        self.max_exact_logdet_dim = max_exact_logdet_dim
+        self.step_size, self.num_steps, self._step_size_divisible = self._resolve_step_size(
+            step_size,
+            enforce_divisible=enforce_divisible,
+            auto_adjust=auto_adjust_step_size
+        )
         self.deterministic_trace = deterministic_trace
         self.mixture_prob = mixture_prob
         self.broad_scale = broad_scale
@@ -52,6 +81,36 @@ class FlowProposal(nn.Module):
         # This acts as a "salt" for the hash function
         self.register_buffer("hash_salt", torch.randn(dim))
 
+    def _resolve_step_size(
+        self,
+        step_size: float,
+        enforce_divisible: bool = True,
+        auto_adjust: bool = True
+    ) -> tuple[float, int, bool]:
+        inv = 1.0 / step_size
+        steps = int(round(inv))
+        divisible = np.isclose(inv, steps, rtol=0.0, atol=1e-6)
+        if not divisible:
+            msg = (
+                f"step_size={step_size} does not divide 1.0; "
+                "numerical integration grid will be inconsistent."
+            )
+            if enforce_divisible and auto_adjust:
+                new_step = 1.0 / steps
+                warnings.warn(f"{msg} Adjusting step_size to {new_step}.", RuntimeWarning)
+                return new_step, steps, True
+            if enforce_divisible:
+                raise ValueError(msg)
+            warnings.warn(msg, RuntimeWarning)
+        return step_size, max(1, steps), divisible
+
+    def set_step_size(self, step_size: float, enforce_divisible: bool = True, auto_adjust: bool = True) -> None:
+        self.step_size, self.num_steps, self._step_size_divisible = self._resolve_step_size(
+            step_size,
+            enforce_divisible=enforce_divisible,
+            auto_adjust=auto_adjust
+        )
+
     def _rk4_step_func(self, f: Any, x: torch.Tensor, t: float, dt: float) -> torch.Tensor:
         """Standard RK4 stepper for arbitrary function f(x, t)."""
         k1 = f(x, t)
@@ -59,6 +118,17 @@ class FlowProposal(nn.Module):
         k3 = f(x + dt * 0.5 * k2, t + dt * 0.5)
         k4 = f(x + dt * k3, t + dt)
         return x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+    def _euler_step_func(self, f: Any, x: torch.Tensor, t: float, dt: float) -> torch.Tensor:
+        """Explicit Euler stepper."""
+        return x + dt * f(x, t)
+
+    def _step_func(self, f: Any) -> Any:
+        if self.integrator == "rk4":
+            return lambda x, t, dt: self._rk4_step_func(f, x, t, dt)
+        if self.integrator == "euler":
+            return lambda x, t, dt: self._euler_step_func(f, x, t, dt)
+        raise ValueError(f"Unsupported integrator: {self.integrator}")
 
     def sample(self, num_samples: int) -> torch.Tensor:
         try:
@@ -90,15 +160,15 @@ class FlowProposal(nn.Module):
             # Integrate 0 -> 1 using RK4
             x = z
             t = 0.0
-            steps = int(1.0 / self.step_size)
+            steps = self.num_steps
             
-            # Define dynamics function for RK4
             def dynamics(x_curr, t_curr):
                 return self.net(x_curr, t_curr)
 
+            step_fn = self._step_func(dynamics)
             with torch.no_grad():
                 for _ in range(steps):
-                    x = self._rk4_step_func(dynamics, x, t, self.step_size)
+                    x = step_fn(x, t, self.step_size)
                     t += self.step_size
             
             # Place in output
@@ -120,13 +190,13 @@ class FlowProposal(nn.Module):
         
         # Fast Vectorized Pseudo-Hash
         # Map x -> (B, D) using a fixed random matrix
-        if not hasattr(self, 'proj_mat'):
-             # Lazy init buffer
+        if not hasattr(self, "proj_mat"):
              generator = torch.Generator(device=x.device).manual_seed(42)
-             self.proj_mat = torch.randn(self.dim, self.dim, device=x.device, generator=generator)
+             proj = torch.randn(self.dim, self.dim, device=x.device, generator=generator)
+             self.register_buffer("proj_mat", proj)
              
         # y = x @ M
-        y = torch.matmul(x, self.proj_mat)
+        y = torch.matmul(x, self.proj_mat) + self.hash_salt
         
         # Adjust 'seed' for different probes by adding offset to y
         # We add probe_idx * large_prime
@@ -163,12 +233,32 @@ class FlowProposal(nn.Module):
         """
         fine_step = self.step_size # or even 0.5 * step_size? Let's use standard step size as "exact" reference.
         
-        if self.dim <= 64:
+        use_discrete_logdet = self.exact_discrete_logdet
+        if use_discrete_logdet and self.dim > self.max_exact_logdet_dim:
+            warnings.warn(
+                "exact_discrete_logdet requested but dim exceeds max_exact_logdet_dim; "
+                "falling back to trace-based logdet.",
+                RuntimeWarning
+            )
+            use_discrete_logdet = False
+
+        if self.dim <= self.max_exact_trace_dim:
             # Exact Trace
-            log_q_flow = self._log_prob_core(x, fine_step, exact_trace=True)
+            log_q_flow = self._log_prob_core(
+                x,
+                fine_step,
+                exact_trace=True,
+                discrete_logdet=use_discrete_logdet
+            )
         else:
             # High-fidelity approx
-            log_q_flow = self._log_prob_core(x, fine_step, exact_trace=False, num_hutchinson=10)
+            log_q_flow = self._log_prob_core(
+                x,
+                fine_step,
+                exact_trace=False,
+                num_hutchinson=10,
+                discrete_logdet=use_discrete_logdet
+            )
             
         return self._mix_density(x, log_q_flow)
         
@@ -197,7 +287,40 @@ class FlowProposal(nn.Module):
         
         return torch.logaddexp(log_one_minus_eta + log_q_flow, log_eta + log_r_broad)
 
-    def _log_prob_core(self, x: torch.Tensor, step_size: float, exact_trace: bool = False, num_hutchinson: int = 1, is_cheap: bool=False) -> torch.Tensor:
+    def exactness_report(self) -> List[str]:
+        warnings_list: List[str] = []
+        if not self.deterministic_trace:
+            warnings_list.append("deterministic_trace=False: log_q is stochastic; exactness requires pseudo-marginal treatment.")
+        if not self._step_size_divisible:
+            warnings_list.append("step_size does not divide 1.0; integration grid is inconsistent.")
+        if self.dim > self.max_exact_trace_dim:
+            warnings_list.append("log_prob_exact uses Hutchinson trace for dim > max_exact_trace_dim.")
+        if not self.exact_discrete_logdet:
+            warnings_list.append("log_prob_exact uses divergence integral, not discrete-step logdet.")
+        if self.exact_discrete_logdet and self.dim > self.max_exact_logdet_dim:
+            warnings_list.append("exact_discrete_logdet disabled due to max_exact_logdet_dim.")
+        if self.integrator not in ("rk4", "euler"):
+            warnings_list.append(f"Unsupported integrator '{self.integrator}'.")
+        return warnings_list
+
+    def is_exact(self) -> bool:
+        return len(self.exactness_report()) == 0
+
+    def log_prob_unbiased(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "Pseudo-marginal mode requires an unbiased estimator of q(x), "
+            "which FlowProposal does not provide."
+        )
+
+    def _log_prob_core(
+        self,
+        x: torch.Tensor,
+        step_size: float,
+        exact_trace: bool = False,
+        num_hutchinson: int = 1,
+        is_cheap: bool = False,
+        discrete_logdet: bool = False
+    ) -> torch.Tensor:
         """
         Compute log q(x) using Hutchinson trace estimator or exact trace with RK4 integration.
         Integration operates backwards from 1 -> 0.
@@ -208,87 +331,77 @@ class FlowProposal(nn.Module):
         
         xt = x.clone()
         zero = torch.zeros(batch_size, 1, device=device)
-        log_jac_trace = zero.clone() # Accumulate integral of div
+        log_jac_trace = zero.clone()
         
         # Time steps for backward integration (1 -> 0)
+        step_size, steps, _ = self._resolve_step_size(
+            step_size,
+            enforce_divisible=False,
+            auto_adjust=False
+        )
         dt = -step_size
-        steps = int(1.0 / step_size)
         t = 1.0
         
         # Prepare noise vectors if Hutchinson
         # If exact_trace is True, we don't need noise.
         # If num_hutchinson > 1, we need multiple probes.
         probes = []
-        if not exact_trace:
+        if not exact_trace and not discrete_logdet:
             for k in range(num_hutchinson):
-                 # For cheap mode, we want stability. Using probe_idx ensures we use different noises for different probes,
-                 # but specific probe 0 is always the same for a given x.
                  probes.append(self._get_hutchinson_noise(xt, probe_idx=k))
         
-        def dynamics_combined(state, t_curr):
-            # state is (x_curr, trace_curr)
-            x_c, _ = state
-            
-            # 1. dx/dt = v(x, t)
-            # Enable grad for Trace
-            with torch.enable_grad():
-                x_in = x_c.detach().requires_grad_(True)
-                v = self.net(x_in, t_curr)
-                
-            # 2. dtrace/dt = div(v)
-                if exact_trace:
-                    # Efficient Exact Trace using vmap + jacrev
-                    # We compute the Jacobian for each batch element: (D, D)
-                    # Then take the trace.
-                    
-                    def dynamics_func(x_in_inner):
-                        # Wrapper to handle (D,) input -> (D,) output for jacrev
-                        # We need to unsqueeze to pass to net (expecting B, D)
-                        # but vmap handles the batch dimension.
-                        return self.net(x_in_inner.unsqueeze(0), t_curr).squeeze(0)
+        def dynamics(x_curr, t_curr):
+            return self.net(x_curr, t_curr)
 
-                    # Compute Jacobian per sample: (B, D, D)
-                    # use jacrev (reverse mode AD) which is usually better for D_out ~ D_in
-                    jac = torch.vmap(torch.func.jacrev(dynamics_func))(x_in)
-                    
-                    # Trace: sum of diagonal elements (B,)
-                    # jac: (B, D, D) -> diagonal: (B, D) -> sum: (B,)
-                    trace_est = torch.vmap(torch.trace)(jac).unsqueeze(1)
-                    
-                else:
-                    # Hutchinson Trace
-                    # Average over probes
-                    trace_est = torch.zeros(batch_size, 1, device=device)
-                    for eps in probes:
-                        # jvp
-                        def func_v(inputs):
-                            return self.net(inputs, t_curr)
-                        
-                        _, jvp_val = torch.autograd.functional.jvp(func_v, x_in, v=eps)
-                        
-                        # trace_sample = eps^T * jvp
-                        trace_sample = torch.sum(eps * jvp_val, dim=1, keepdim=True)
-                        trace_est += trace_sample
-                    
-                    trace_est = trace_est / num_hutchinson
-                
-            return v, trace_est
+        step_fn = self._step_func(dynamics)
 
-        # Custom RK4 for tuple state
-        for _ in range(steps):
-             # Tuple RK4
-             v1, tr1 = dynamics_combined((xt, log_jac_trace), t)
-             v2, tr2 = dynamics_combined((xt + dt*0.5*v1, log_jac_trace + dt*0.5*tr1), t + dt*0.5)
-             v3, tr3 = dynamics_combined((xt + dt*0.5*v2, log_jac_trace + dt*0.5*tr2), t + dt*0.5)
-             v4, tr4 = dynamics_combined((xt + dt*v3, log_jac_trace + dt*tr3), t + dt)
-             
-             with torch.no_grad():
-                 xt = xt + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4)
-                 log_jac_trace = log_jac_trace + (dt / 6.0) * (tr1 + 2*tr2 + 2*tr3 + tr4)
-             
-             t += dt
+        if discrete_logdet:
+            log_det = zero.clone()
+            for _ in range(steps):
+                def step_single(x_in):
+                    return step_fn(x_in.unsqueeze(0), t, dt).squeeze(0)
+
+                jac = torch.vmap(torch.func.jacrev(step_single))(xt)
+                _, logabsdet = torch.linalg.slogdet(jac)
+                log_det = log_det + logabsdet.unsqueeze(1)
+                xt = step_fn(xt, t, dt)
+                t += dt
+        else:
+            def dynamics_combined(state, t_curr):
+                x_c, _ = state
+                with torch.enable_grad():
+                    x_in = x_c.detach().requires_grad_(True)
+                    v = self.net(x_in, t_curr)
+                    if exact_trace:
+                        def dynamics_func(x_in_inner):
+                            return self.net(x_in_inner.unsqueeze(0), t_curr).squeeze(0)
+                        jac = torch.vmap(torch.func.jacrev(dynamics_func))(x_in)
+                        trace_est = torch.vmap(torch.trace)(jac).unsqueeze(1)
+                    else:
+                        trace_est = torch.zeros(batch_size, 1, device=device)
+                        for eps in probes:
+                            def func_v(inputs):
+                                return self.net(inputs, t_curr)
+                            _, jvp_val = torch.autograd.functional.jvp(func_v, x_in, v=eps)
+                            trace_sample = torch.sum(eps * jvp_val, dim=1, keepdim=True)
+                            trace_est += trace_sample
+                        trace_est = trace_est / num_hutchinson
+                return v, trace_est
+
+            for _ in range(steps):
+                v1, tr1 = dynamics_combined((xt, log_jac_trace), t)
+                v2, tr2 = dynamics_combined((xt + dt*0.5*v1, log_jac_trace + dt*0.5*tr1), t + dt*0.5)
+                v3, tr3 = dynamics_combined((xt + dt*0.5*v2, log_jac_trace + dt*0.5*tr2), t + dt*0.5)
+                v4, tr4 = dynamics_combined((xt + dt*v3, log_jac_trace + dt*tr3), t + dt)
+                
+                with torch.no_grad():
+                    xt = xt + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4)
+                    log_jac_trace = log_jac_trace + (dt / 6.0) * (tr1 + 2*tr2 + 2*tr3 + tr4)
+                t += dt
             
         # Final z is xt (at t=0)
         log_prob_z = -0.5 * torch.sum(xt**2, dim=1) - 0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi, device=device))
-        
+
+        if discrete_logdet:
+            return log_prob_z + log_det.squeeze(1)
         return log_prob_z - log_jac_trace.squeeze(1)

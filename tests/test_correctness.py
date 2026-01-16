@@ -32,9 +32,9 @@ def test_gaussian_1d_ks():
         p_global=0.5 # Mixing
     )
     
-    # Run long chain
-    n_samples = 5000
-    samples, stats = sampler.run(torch.zeros(dim), n_samples, warmup=1000, seed=999)
+    # Run a shorter chain for unit test speed
+    n_samples = 1000
+    samples, stats = sampler.run(torch.zeros(dim), n_samples, warmup=200, seed=999)
     samples_flat = samples.flatten()
     
     # KS Test

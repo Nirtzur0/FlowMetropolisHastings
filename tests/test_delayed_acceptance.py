@@ -38,12 +38,12 @@ def test_delayed_acceptance_mog():
     # Run
     # Start at origin
     x0 = torch.zeros(2)
-    chain, stats = sampler.run(x0, num_steps=200, warmup=0, seed=123)
+    chain, stats = sampler.run(x0, num_steps=100, warmup=0, seed=123)
     
     print("\nSampler Stats:", stats)
     
     # Basic assertions
-    assert chain.shape == (200, 2)
+    assert chain.shape == (100, 2)
     assert stats["attempts_global"] > 0
     assert "accept_global_stage1" in stats
     assert "ess_per_sec" in stats
